@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.pyc
+.env
+.venv
+venv/
+/backend/__pycache__
+
+# Node / React
+/frontend/node_modules
+/frontend/build
+/frontend/npm-debug.log*
+
+# OS generated files
+.DS_Store
+Thumbs.db
+
+# Database and API keys (IMPORTANT)
+factions_bank_test_second.sql  # Ignore large dumps
+*.key
+*.secret
+# You may also consider ignoring app.py if it contains sensitive API_KEY/DB_PASS, 
+# but since you are replacing them with environment variables, it may be fine.
