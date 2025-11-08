@@ -9,8 +9,7 @@ import pymysql
 DB_HOST = os.getenv("BANK_DB_HOST", "127.0.0.1")
 DB_USER = os.getenv("BANK_DB_USER", "factions_test")
 DB_PASS = os.getenv("BANK_DB_PASS", "SuperSecureTestPass123")
-# CHANGED: Use test database
-DB_NAME = os.getenv("BANK_DB_NAME", "factions_bank_test_second")
+DB_NAME = os.getenv("BANK_DB_NAME", "factions_bank")
 API_KEY = os.getenv("BANK_API_KEY", "d6892971-aada-4ab6-ac14-76cd4c77054b")
 
 def db():
@@ -32,59 +31,31 @@ def require_api_key():
     if not k or k != API_KEY:
         abort(401, "invalid or missing API key")
 
-# -------------------- HELPERS --------------------
-def ensure_player_account(c, ign):
-    c.execute("SELECT id FROM players WHERE ign=%s", (ign,))
-    row = c.fetchone()
-    if not row:
-        c.execute("INSERT INTO players(ign) VALUES (%s)", (ign,))
-        player_id = c.lastrowid
-    else:
-        player_id = row["id"]
+# -------------------- BANK ROUTES --------------------
 
-    c.execute("SELECT id FROM accounts WHERE player_id=%s AND status='active'", (player_id,))
-    acc = c.fetchone()
-    if not acc:
-        c.execute("INSERT INTO accounts(player_id) VALUES (%s)", (player_id,))
-        account_id = c.lastrowid
-    else:
-        account_id = acc["id"]
-    return account_id
-
-# -------------------- API ROUTES --------------------
-
-# Fetch players list (with balances, interest rate, premium status)
 @app.get("/api/players")
 def api_players():
     q = request.args.get("q", "")
     limit = min(int(request.args.get("limit", 200)), 1000)
     offset = int(request.args.get("offset", 0))
     
-    print(f"📥 GET /api/players - query: '{q}', limit: {limit}")
-    
     try:
         with db() as cx:
             with cx.cursor() as c:
-                # Get settings for premium calculation
                 c.execute("""
-                    SELECT normal_interest_rate, premium_interest_rate, 
-                           premium_balance_requirement 
+                    SELECT interest_rate_per_period as normal_interest_rate, 
+                           premium_interest_rate_per_period as premium_interest_rate, 
+                           premium_min_balance as premium_balance_requirement 
                     FROM settings WHERE id=1
                 """)
-                settings = c.fetchone()
+                settings = c.fetchone() or {
+                    'normal_interest_rate': 0.05,
+                    'premium_interest_rate': 0.06,
+                    'premium_balance_requirement': 1000000000.00
+                }
                 
-                if not settings:
-                    print("⚠️  No settings found, using defaults")
-                    settings = {
-                        'normal_interest_rate': 0.05,
-                        'premium_interest_rate': 0.06,
-                        'premium_balance_requirement': 1000000000.00
-                    }
-                
-                # Build player query
                 sql = """
-                    SELECT p.ign, a.balance, a.last_compounded_at,
-                           p.created_at
+                    SELECT p.ign, a.balance, a.last_compounded_at, p.created_at
                     FROM players p
                     JOIN accounts a ON a.player_id = p.id AND a.status='active'
                 """
@@ -100,9 +71,6 @@ def api_players():
                 c.execute(sql, params)
                 players = c.fetchall()
                 
-                print(f"✅ Found {len(players)} players")
-                
-                # Add premium status and interest rate to each player
                 for player in players:
                     balance = float(player['balance'] or 0)
                     premium_req = float(settings['premium_balance_requirement'] or 0)
@@ -113,32 +81,25 @@ def api_players():
                         settings['premium_interest_rate'] if is_premium 
                         else settings['normal_interest_rate']
                     )
+                    player['balance'] = balance
                     
-                    # Convert decimal to float
-                    player['balance'] = float(player['balance'] or 0)
-                    
-                    # Convert datetime to ISO string
                     if player.get('last_compounded_at'):
                         player['last_compounded_at'] = player['last_compounded_at'].isoformat()
                     if player.get('created_at'):
                         player['created_at'] = player['created_at'].isoformat()
         
         return jsonify(players)
-    
     except Exception as e:
-        print(f"❌ Error in /api/players: {e}")
+        print(f"❌ Error: {e}")
         import traceback
         traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-# Fetch transactions
 @app.get("/api/transactions")
 def api_transactions():
     ign = request.args.get("ign", "")
     limit = min(int(request.args.get("limit", 200)), 1000)
     offset = int(request.args.get("offset", 0))
-    
-    print(f"📥 GET /api/transactions - ign: '{ign}', limit: {limit}")
     
     try:
         with db() as cx:
@@ -151,8 +112,7 @@ def api_transactions():
                         JOIN accounts a ON a.id=t.account_id
                         JOIN players p ON p.id=a.player_id
                         WHERE p.ign LIKE %s
-                        ORDER BY t.id DESC
-                        LIMIT %s OFFSET %s
+                        ORDER BY t.id DESC LIMIT %s OFFSET %s
                     """, (f"%{ign}%", limit, offset))
                 else:
                     c.execute("""
@@ -161,93 +121,65 @@ def api_transactions():
                         FROM transactions t
                         JOIN accounts a ON a.id=t.account_id
                         JOIN players p ON p.id=a.player_id
-                        ORDER BY t.id DESC
-                        LIMIT %s OFFSET %s
+                        ORDER BY t.id DESC LIMIT %s OFFSET %s
                     """, (limit, offset))
                 
                 txns = c.fetchall()
                 
-                print(f"✅ Found {len(txns)} transactions")
-                
-                # Convert types
                 for t in txns:
-                    # Convert decimals to floats
-                    if 'amount' in t:
-                        t['amount'] = float(t['amount'] or 0)
-                    if 'effective_delta' in t:
-                        t['effective_delta'] = float(t['effective_delta'] or 0)
-                    if 'balance_after' in t:
-                        t['balance_after'] = float(t['balance_after'] or 0)
-                    if 'before_balance' in t:
-                        t['before_balance'] = float(t['before_balance'] or 0)
+                    for field in ['amount', 'effective_delta', 'balance_after', 'before_balance']:
+                        if field in t:
+                            t[field] = float(t[field] or 0)
                     if 'fee_pct' in t and t['fee_pct'] is not None:
                         t['fee_pct'] = float(t['fee_pct'])
-                    
-                    # Convert datetime to ISO string
                     if t.get('created_at'):
                         t['created_at'] = t['created_at'].isoformat()
         
         return jsonify(txns)
-    
     except Exception as e:
-        print(f"❌ Error in /api/transactions: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Settings (interest & payout) - FIXED to match frontend expectations
 @app.get("/api/settings")
 def api_settings():
-    print(f"📥 GET /api/settings")
-    
     try:
         with db() as cx:
             with cx.cursor() as c:
-                # Get bank settings
                 c.execute("""
-                    SELECT payout_fee_pct, normal_interest_rate, 
-                           premium_interest_rate, premium_balance_requirement
+                    SELECT payout_fee_pct, 
+                           interest_rate_per_period as normal_interest_rate, 
+                           premium_interest_rate_per_period as premium_interest_rate, 
+                           premium_min_balance as premium_balance_requirement
                     FROM settings WHERE id=1
                 """)
-                bank_settings = c.fetchone()
+                bank_settings = c.fetchone() or {
+                    'payout_fee_pct': 0.07,
+                    'normal_interest_rate': 0.05,
+                    'premium_interest_rate': 0.06,
+                    'premium_balance_requirement': 1000000000.00
+                }
                 
-                if not bank_settings:
-                    print("⚠️  No bank settings found, using defaults")
-                    bank_settings = {
-                        'payout_fee_pct': 0.07,
-                        'normal_interest_rate': 0.05,
-                        'premium_interest_rate': 0.06,
-                        'premium_balance_requirement': 1000000000.00
-                    }
-                
-                # Get horse race settings
                 c.execute("""
                     SELECT winner_cut_pct, second_cut_pct, third_cut_pct,
                            entry_fee, imperial_cut_pct, rules
                     FROM horse_race_settings WHERE id=1
                 """)
-                race_settings = c.fetchone()
+                race_settings = c.fetchone() or {
+                    'winner_cut_pct': 50.00,
+                    'second_cut_pct': 30.00,
+                    'third_cut_pct': 20.00,
+                    'entry_fee': 100.00,
+                    'imperial_cut_pct': 10.00,
+                    'rules': 'No rules set'
+                }
                 
-                if not race_settings:
-                    print("⚠️  No race settings found, using defaults")
-                    race_settings = {
-                        'winner_cut_pct': 50.00,
-                        'second_cut_pct': 30.00,
-                        'third_cut_pct': 20.00,
-                        'entry_fee': 100.00,
-                        'imperial_cut_pct': 10.00,
-                        'rules': 'No rules set'
-                    }
-                
-                # Calculate total bank debt
                 c.execute("""
                     SELECT COALESCE(SUM(balance), 0) AS total 
                     FROM accounts WHERE status='active'
                 """)
                 debt = c.fetchone()
                 
-                # Format response to match frontend expectations
-                response = {
+                return jsonify({
                     "bank": {
                         "payout_fee_pct": float(bank_settings['payout_fee_pct'] or 0),
                         "interest_rate_normal": float(bank_settings['normal_interest_rate'] or 0),
@@ -263,67 +195,42 @@ def api_settings():
                         "rules": race_settings['rules'] or ""
                     },
                     "total_bank_debt": float(debt['total'] or 0)
-                }
-                
-                print(f"✅ Settings loaded - Total debt: ${response['total_bank_debt']:,.2f}")
-        
-        return jsonify(response)
-    
+                })
     except Exception as e:
-        print(f"❌ Error in /api/settings: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Interest rate history
 @app.get("/api/interest/history")
 def api_interest_history():
     limit = min(int(request.args.get("limit", 1000)), 5000)
-    
-    print(f"📥 GET /api/interest/history - limit: {limit}")
     
     try:
         with db() as cx:
             with cx.cursor() as c:
                 c.execute("""
-                    SELECT id, created_at AS changed_at, 
-                           normal_interest_rate AS rate_normal_pct, 
-                           premium_interest_rate AS rate_premium_pct,
-                           premium_balance_requirement AS premium_min_balance
+                    SELECT id, changed_at, 
+                           normal_rate AS rate_normal_pct, 
+                           premium_rate AS rate_premium_pct,
+                           premium_min_balance
                     FROM interest_rate_history 
-                    ORDER BY created_at ASC 
-                    LIMIT %s
+                    ORDER BY changed_at ASC LIMIT %s
                 """, (limit,))
                 rows = c.fetchall()
                 
-                print(f"✅ Found {len(rows)} history entries")
-                
-                # Convert types
                 for r in rows:
-                    if 'rate_normal_pct' in r:
-                        r['rate_normal_pct'] = float(r['rate_normal_pct'] or 0)
-                    if 'rate_premium_pct' in r:
-                        r['rate_premium_pct'] = float(r['rate_premium_pct'] or 0)
-                    if 'premium_min_balance' in r:
-                        r['premium_min_balance'] = float(r['premium_min_balance'] or 0)
-                    
-                    # Convert datetime to ISO string
+                    for field in ['rate_normal_pct', 'rate_premium_pct', 'premium_min_balance']:
+                        if field in r:
+                            r[field] = float(r[field] or 0)
                     if r.get('changed_at'):
                         r['changed_at'] = r['changed_at'].isoformat()
         
         return jsonify(rows)
-    
     except Exception as e:
-        print(f"❌ Error in /api/interest/history: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Races - FIXED to match frontend expectations
 @app.get("/api/races")
 def get_races():
-    print(f"📥 GET /api/races")
-    
     try:
         with db() as cx:
             with cx.cursor() as c:
@@ -337,75 +244,391 @@ def get_races():
                                ELSE 'scheduled'
                            END AS status,
                            (SELECT COUNT(*) FROM horse_jockeys hj WHERE hj.race_id = r.id) AS jockey_count
-                    FROM horse_races r
-                    ORDER BY r.id DESC
+                    FROM horse_races r ORDER BY r.id DESC
                 """)
                 races = c.fetchall()
                 
-                print(f"✅ Found {len(races)} races")
-                
-                # Get jockey names and winner names for each race
                 for race in races:
                     race_id = race['id']
-                    
-                    # Convert prize_pool to float
                     race['prize_pool'] = float(race['prize_pool'] or 0)
                     
-                    # Get jockeys
                     c.execute("""
-                        SELECT p.ign 
-                        FROM horse_jockeys hj
+                        SELECT p.ign FROM horse_jockeys hj
                         JOIN players p ON p.id = hj.player_id
-                        WHERE hj.race_id = %s
-                        ORDER BY hj.joined_at
+                        WHERE hj.race_id = %s ORDER BY hj.joined_at
                     """, (race_id,))
-                    jockeys = [j['ign'] for j in c.fetchall()]
-                    race['jockeys'] = jockeys
+                    race['jockeys'] = [j['ign'] for j in c.fetchall()]
                     
-                    # Get winner names
-                    if race['winner1_id']:
-                        c.execute("SELECT ign FROM players WHERE id=%s", (race['winner1_id'],))
-                        w = c.fetchone()
-                        race['winner1'] = w['ign'] if w else None
-                    else:
-                        race['winner1'] = None
+                    for i in range(1, 4):
+                        if race[f'winner{i}_id']:
+                            c.execute("SELECT ign FROM players WHERE id=%s", (race[f'winner{i}_id'],))
+                            w = c.fetchone()
+                            race[f'winner{i}'] = w['ign'] if w else None
+                        else:
+                            race[f'winner{i}'] = None
+                        race.pop(f'winner{i}_id', None)
                     
-                    if race['winner2_id']:
-                        c.execute("SELECT ign FROM players WHERE id=%s", (race['winner2_id'],))
-                        w = c.fetchone()
-                        race['winner2'] = w['ign'] if w else None
-                    else:
-                        race['winner2'] = None
-                    
-                    if race['winner3_id']:
-                        c.execute("SELECT ign FROM players WHERE id=%s", (race['winner3_id'],))
-                        w = c.fetchone()
-                        race['winner3'] = w['ign'] if w else None
-                    else:
-                        race['winner3'] = None
-                    
-                    # Convert datetimes to ISO strings
-                    if race.get('scheduled_at'):
-                        race['scheduled_at'] = race['scheduled_at'].isoformat()
-                    if race.get('ends_at'):
-                        race['ends_at'] = race['ends_at'].isoformat()
-                    if race.get('created_at'):
-                        race['created_at'] = race['created_at'].isoformat()
-                    
-                    # Remove ID fields
-                    race.pop('winner1_id', None)
-                    race.pop('winner2_id', None)
-                    race.pop('winner3_id', None)
+                    for field in ['scheduled_at', 'ends_at', 'created_at']:
+                        if race.get(field):
+                            race[field] = race[field].isoformat()
         
         return jsonify(races)
-    
     except Exception as e:
-        print(f"❌ Error in /api/races: {e}")
-        import traceback
-        traceback.print_exc()
+        print(f"❌ Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# Health check
+# -------------------- HORSE RACE ROUTES --------------------
+
+@app.post("/api/races/new")
+def create_race():
+    require_api_key()
+    data = request.json
+    
+    race_name = data.get("name", f"Imperial Race {datetime.now().strftime('%Y-%m-%d')}")
+    starts_at = data.get("starts_at")
+    
+    if not starts_at:
+        return jsonify({"error": "starts_at is required"}), 400
+    
+    try:
+        starts_at_dt = datetime.fromisoformat(starts_at.replace('Z', '+00:00'))
+    except:
+        return jsonify({"error": "Invalid starts_at format"}), 400
+    
+    try:
+        with db() as cx:
+            with cx.cursor() as c:
+                c.execute("""
+                    INSERT INTO horse_races (name, race_name, prize_pool, starts_at)
+                    VALUES (%s, %s, 0.00, %s)
+                """, (race_name, race_name, starts_at_dt))
+                race_id = c.lastrowid
+                cx.commit()
+                
+                return jsonify({
+                    "success": True,
+                    "race_id": race_id,
+                    "name": race_name,
+                    "starts_at": starts_at_dt.isoformat()
+                })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/races/enroll")
+def enroll_jockey():
+    require_api_key()
+    data = request.json
+    
+    player_name = data.get("player_name")
+    if not player_name:
+        return jsonify({"error": "player_name is required"}), 400
+    
+    try:
+        with db() as cx:
+            with cx.cursor() as c:
+                # Get latest active race
+                c.execute("""
+                    SELECT id, prize_pool, name
+                    FROM horse_races 
+                    WHERE ends_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                """)
+                race = c.fetchone()
+                if not race:
+                    return jsonify({"error": "No active race found"}), 404
+                
+                race_id = race['id']
+                
+                # Get player
+                c.execute("SELECT id FROM players WHERE ign=%s", (player_name,))
+                player = c.fetchone()
+                if not player:
+                    return jsonify({"error": f"Player {player_name} not found"}), 404
+                
+                player_id = player['id']
+                
+                # Check if already enrolled
+                c.execute("""
+                    SELECT id FROM horse_jockeys 
+                    WHERE race_id=%s AND player_id=%s
+                """, (race_id, player_id))
+                if c.fetchone():
+                    return jsonify({"error": f"{player_name} already enrolled"}), 400
+                
+                # Get account
+                c.execute("""
+                    SELECT id, balance FROM accounts 
+                    WHERE player_id=%s AND status='active'
+                """, (player_id,))
+                account = c.fetchone()
+                if not account:
+                    return jsonify({"error": f"No active account for {player_name}"}), 404
+                
+                # Get settings
+                c.execute("""
+                    SELECT entry_fee, imperial_cut_pct 
+                    FROM horse_race_settings WHERE id=1
+                """)
+                settings = c.fetchone()
+                
+                entry_fee = float(settings['entry_fee'] or 100)
+                imperial_cut_pct = float(settings['imperial_cut_pct'] or 10) / 100
+                
+                # Check balance
+                if float(account['balance']) < entry_fee:
+                    return jsonify({
+                        "error": f"Insufficient balance. Required: ${entry_fee:,.2f}"
+                    }), 400
+                
+                # Calculate amounts
+                imperial_cut = entry_fee * imperial_cut_pct
+                prize_contribution = entry_fee - imperial_cut
+                
+                # Create transaction
+                c.execute("""
+                    INSERT INTO transactions (account_id, txn_type, amount, note)
+                    VALUES (%s, 'payout', %s, %s)
+                """, (account['id'], entry_fee, f"Horse race entry - {race['name']}"))
+                
+                # Add jockey
+                c.execute("""
+                    INSERT INTO horse_jockeys (race_id, player_id)
+                    VALUES (%s, %s)
+                """, (race_id, player_id))
+                
+                # Update prize pool
+                new_prize_pool = float(race['prize_pool']) + prize_contribution
+                c.execute("""
+                    UPDATE horse_races SET prize_pool = %s WHERE id = %s
+                """, (new_prize_pool, race_id))
+                
+                cx.commit()
+                
+                return jsonify({
+                    "success": True,
+                    "player": player_name,
+                    "race_id": race_id,
+                    "entry_fee": entry_fee,
+                    "prize_pool": new_prize_pool,
+                    "imperial_cut": imperial_cut
+                })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+def _set_winner(player_name, position):
+    """Helper to set winner and award prize"""
+    try:
+        with db() as cx:
+            with cx.cursor() as c:
+                # Get latest race
+                c.execute("""
+                    SELECT r.id, r.prize_pool, r.name,
+                           r.winner1_id, r.winner2_id, r.winner3_id
+                    FROM horse_races r
+                    WHERE r.ends_at IS NULL
+                    ORDER BY r.id DESC LIMIT 1
+                """)
+                race = c.fetchone()
+                if not race:
+                    return jsonify({"error": "No active race found"}), 404
+                
+                # Get player
+                c.execute("SELECT id FROM players WHERE ign=%s", (player_name,))
+                player = c.fetchone()
+                if not player:
+                    return jsonify({"error": f"Player {player_name} not found"}), 404
+                
+                player_id = player['id']
+                
+                # Check if enrolled
+                c.execute("""
+                    SELECT id FROM horse_jockeys 
+                    WHERE race_id=%s AND player_id=%s
+                """, (race['id'], player_id))
+                if not c.fetchone():
+                    return jsonify({"error": f"{player_name} not enrolled in race"}), 400
+                
+                # Check if already a winner
+                for i in range(1, 4):
+                    if i != position and race[f'winner{i}_id'] == player_id:
+                        return jsonify({"error": f"{player_name} already winner {i}"}), 400
+                
+                # Get prize distribution
+                c.execute("""
+                    SELECT winner_cut_pct, second_cut_pct, third_cut_pct
+                    FROM horse_race_settings WHERE id=1
+                """)
+                settings = c.fetchone()
+                
+                prize_pool = float(race['prize_pool'] or 0)
+                pct_map = {
+                    1: float(settings['winner_cut_pct']),
+                    2: float(settings['second_cut_pct']),
+                    3: float(settings['third_cut_pct'])
+                }
+                prize_amount = prize_pool * (pct_map[position] / 100)
+                
+                # Get account
+                c.execute("""
+                    SELECT id FROM accounts 
+                    WHERE player_id=%s AND status='active'
+                """, (player_id,))
+                account = c.fetchone()
+                if not account:
+                    return jsonify({"error": f"No active account for {player_name}"}), 404
+                
+                # Set winner
+                c.execute(f"""
+                    UPDATE horse_races 
+                    SET winner{position}_id = %s 
+                    WHERE id = %s
+                """, (player_id, race['id']))
+                
+                # Award prize
+                c.execute("""
+                    INSERT INTO transactions (account_id, txn_type, amount, note)
+                    VALUES (%s, 'deposit', %s, %s)
+                """, (account['id'], prize_amount, f"Horse race - Position {position} - {race['name']}"))
+                
+                cx.commit()
+                
+                return jsonify({
+                    "success": True,
+                    "player": player_name,
+                    "position": position,
+                    "prize": prize_amount,
+                    "race_id": race['id']
+                })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/races/winner1")
+def set_winner1():
+    require_api_key()
+    data = request.json
+    player_name = data.get("player_name")
+    if not player_name:
+        return jsonify({"error": "player_name is required"}), 400
+    return _set_winner(player_name, 1)
+
+@app.post("/api/races/winner2")
+def set_winner2():
+    require_api_key()
+    data = request.json
+    player_name = data.get("player_name")
+    if not player_name:
+        return jsonify({"error": "player_name is required"}), 400
+    return _set_winner(player_name, 2)
+
+@app.post("/api/races/winner3")
+def set_winner3():
+    require_api_key()
+    data = request.json
+    player_name = data.get("player_name")
+    if not player_name:
+        return jsonify({"error": "player_name is required"}), 400
+    return _set_winner(player_name, 3)
+
+@app.get("/api/races/info")
+def race_info():
+    try:
+        with db() as cx:
+            with cx.cursor() as c:
+                c.execute("""
+                    SELECT r.id, COALESCE(r.name, r.race_name, 'Unnamed Race') AS name,
+                           r.prize_pool, r.starts_at, r.ends_at,
+                           r.winner1_id, r.winner2_id, r.winner3_id,
+                           (SELECT COUNT(*) FROM horse_jockeys hj WHERE hj.race_id = r.id) AS jockey_count
+                    FROM horse_races r ORDER BY r.id DESC LIMIT 1
+                """)
+                race = c.fetchone()
+                if not race:
+                    return jsonify({"error": "No races found"}), 404
+                
+                race_id = race['id']
+                
+                # Get jockeys
+                c.execute("""
+                    SELECT p.ign FROM horse_jockeys hj
+                    JOIN players p ON p.id = hj.player_id
+                    WHERE hj.race_id = %s ORDER BY hj.joined_at
+                """, (race_id,))
+                jockeys = [j['ign'] for j in c.fetchall()]
+                
+                # Get winners
+                winners = {}
+                for i in range(1, 4):
+                    if race[f'winner{i}_id']:
+                        c.execute("SELECT ign FROM players WHERE id=%s", (race[f'winner{i}_id'],))
+                        w = c.fetchone()
+                        winners[f'winner{i}'] = w['ign'] if w else None
+                    else:
+                        winners[f'winner{i}'] = None
+                
+                # Get prize distribution
+                c.execute("""
+                    SELECT winner_cut_pct, second_cut_pct, third_cut_pct
+                    FROM horse_race_settings WHERE id=1
+                """)
+                settings = c.fetchone()
+                
+                prize_pool = float(race['prize_pool'] or 0)
+                
+                return jsonify({
+                    "race_id": race_id,
+                    "name": race['name'],
+                    "prize_pool": prize_pool,
+                    "starts_at": race['starts_at'].isoformat() if race['starts_at'] else None,
+                    "ends_at": race['ends_at'].isoformat() if race['ends_at'] else None,
+                    "jockey_count": race['jockey_count'],
+                    "jockeys": jockeys,
+                    **winners,
+                    "prize_distribution": {
+                        "winner1": prize_pool * (float(settings['winner_cut_pct']) / 100),
+                        "winner2": prize_pool * (float(settings['second_cut_pct']) / 100),
+                        "winner3": prize_pool * (float(settings['third_cut_pct']) / 100)
+                    }
+                })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
+@app.post("/api/races/end")
+def end_race():
+    require_api_key()
+    
+    try:
+        with db() as cx:
+            with cx.cursor() as c:
+                c.execute("""
+                    SELECT id, winner1_id FROM horse_races 
+                    WHERE ends_at IS NULL
+                    ORDER BY id DESC LIMIT 1
+                """)
+                race = c.fetchone()
+                if not race:
+                    return jsonify({"error": "No active race found"}), 404
+                
+                if not race['winner1_id']:
+                    return jsonify({"error": "Must set winner1 before ending race"}), 400
+                
+                c.execute("""
+                    UPDATE horse_races SET ends_at = NOW() WHERE id = %s
+                """, (race['id'],))
+                cx.commit()
+                
+                return jsonify({
+                    "success": True,
+                    "race_id": race['id'],
+                    "ended_at": datetime.now().isoformat()
+                })
+    except Exception as e:
+        print(f"❌ Error: {e}")
+        return jsonify({"error": str(e)}), 500
+
 @app.get("/healthz")
 def health():
     try:
@@ -416,41 +639,13 @@ def health():
     except Exception as e:
         return jsonify({"ok": False, "error": str(e)}), 500
 
-# Test endpoint to check what data is being returned
-@app.get("/api/debug")
-def debug():
-    try:
-        with db() as cx:
-            with cx.cursor() as c:
-                c.execute("SELECT COUNT(*) as count FROM players")
-                players_count = c.fetchone()
-                
-                c.execute("SELECT COUNT(*) as count FROM accounts WHERE status='active'")
-                accounts_count = c.fetchone()
-                
-                c.execute("SELECT COUNT(*) as count FROM transactions")
-                txn_count = c.fetchone()
-                
-                c.execute("SELECT * FROM settings WHERE id=1")
-                settings = c.fetchone()
-        
-        return jsonify({
-            "database": DB_NAME,
-            "players": players_count['count'],
-            "active_accounts": accounts_count['count'],
-            "transactions": txn_count['count'],
-            "settings": settings
-        })
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
 # -------------------- MAIN --------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8085"))
-    print(f"🌐 Starting server on http://0.0.0.0:{port}")
-    print(f"🔍 Test endpoints at:")
+    print(f"🌐 Server: http://0.0.0.0:{port}")
+    print(f"🔗 Endpoints:")
     print(f"   - http://localhost:{port}/healthz")
-    print(f"   - http://localhost:{port}/api/debug")
     print(f"   - http://localhost:{port}/api/players")
-    print(f"   - http://localhost:{port}/api/settings")
+    print(f"   - http://localhost:{port}/api/races")
+    print(f"   - http://localhost:{port}/api/races/info")
     app.run(host="127.0.0.1", port=port, debug=True)
